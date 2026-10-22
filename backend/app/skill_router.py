@@ -28,7 +28,9 @@ class SkillCatalogCache:
     read, which keeps local development and a cold cache operational.
     """
 
-    def __init__(self, redis_url: str) -> None:
+    def __init__(self, redis_url: str, namespace: str = "dsh") -> None:
+        self.namespace = namespace
+        self.catalog_key = f"{namespace}:skills:catalog:system:v2"
         self.redis = Redis.from_url(redis_url, decode_responses=True) if Redis and redis_url else None
 
     async def close(self) -> None:
@@ -67,14 +69,14 @@ class SkillCatalogCache:
         if not self.redis:
             return
         try:
-            await self.redis.delete(SKILL_CATALOG_KEY)
+            await self.redis.delete(self.catalog_key)
         except Exception:
             return
 
     async def load(self, db: AsyncSession) -> list[dict[str, Any]]:
         if self.redis:
             try:
-                cached = await self.redis.get(SKILL_CATALOG_KEY)
+                cached = await self.redis.get(self.catalog_key)
                 if cached:
                     value = json.loads(cached)
                     if isinstance(value, list):
@@ -93,10 +95,10 @@ class SkillCatalogCache:
         if self.redis:
             try:
                 pipe = self.redis.pipeline()
-                pipe.setex(SKILL_CATALOG_KEY, SKILL_CACHE_TTL_SECONDS, json.dumps(catalog, ensure_ascii=False))
+                pipe.setex(self.catalog_key, SKILL_CACHE_TTL_SECONDS, json.dumps(catalog, ensure_ascii=False))
                 for item in items:
                     pipe.setex(
-                        f"dsh:skill:system:{item.skill_id}:v{item.version}",
+                        f"{self.namespace}:skill:system:{item.skill_id}:v{item.version}",
                         SKILL_CACHE_TTL_SECONDS,
                         json.dumps(self._full(item), ensure_ascii=False),
                     )

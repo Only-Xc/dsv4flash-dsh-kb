@@ -58,15 +58,17 @@ async def lifespan(app: FastAPI):
                 continue
 
     task = asyncio.create_task(sweeper())
-    audit_task = asyncio.create_task(audit_sweeper())
+    audit_task = asyncio.create_task(audit_sweeper()) if settings.audit_cleanup_enabled else None
     yield
     stop.set()
     task.cancel()
-    audit_task.cancel()
+    if audit_task:
+        audit_task.cancel()
     with suppress(asyncio.CancelledError):
         await task
-    with suppress(asyncio.CancelledError):
-        await audit_task
+    if audit_task:
+        with suppress(asyncio.CancelledError):
+            await audit_task
     await service.skill_catalog.close()
 
 

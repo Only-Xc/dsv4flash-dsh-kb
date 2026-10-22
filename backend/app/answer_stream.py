@@ -154,6 +154,13 @@ def public_candidate(text: str) -> bool:
                  r"[\"'](?:tool|toolName|tool_calls?|function_calls?)[\"']\s*:",
                  text, re.I):
         return False
+    # Unbalanced or unfinished fenced code blocks mean the model stream ended
+    # mid-structure; such text is not a publishable Markdown answer.
+    body = text
+    if body.count("```") % 2 or body.count("~~~") % 2:
+        return False
+    if re.search(r"\[[^\]\n]*\]\([^)\n]*$", body) or re.search(r"\[[^\]\n]*$", body):
+        return False
     candidate = text.strip()
     if candidate.startswith("JSON\n"):
         candidate = candidate[5:]

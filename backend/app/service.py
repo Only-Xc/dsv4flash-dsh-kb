@@ -213,7 +213,7 @@ class DSHService:
         )
         self.documents = CustomerDocumentClient(self.settings)
         self.umc_auth = UMCAuthClient(self.settings)
-        self.skill_catalog = SkillCatalogCache(self.settings.redis_url)
+        self.skill_catalog = SkillCatalogCache(self.settings.redis_url, self.settings.skill_cache_namespace)
         self._turn_tasks: dict[str, asyncio.Task[None]] = {}
         self._answer_streams: dict[str, tuple[AnswerStream, str]] = {}
         self._writer_locks: dict[str, asyncio.Lock] = {}
@@ -234,7 +234,7 @@ class DSHService:
         subsequent turns and tool calls.
         """
 
-        restart_only = {"database_url", "redis_url"}
+        restart_only = {"database_url", "redis_url", "database_init_enabled", "audit_cleanup_enabled", "skill_cache_namespace", "knowledge_gateway_url", "platform_gateway_url", "ocr_gateway_url"}
         numeric = {
             "llm_timeout_seconds": float,
             "knowledge_timeout_seconds": float,

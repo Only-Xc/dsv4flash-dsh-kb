@@ -1,3 +1,4 @@
+import os
 from functools import lru_cache
 from typing import ClassVar
 
@@ -15,6 +16,8 @@ class Settings(BaseSettings):
     database_init_enabled: bool = False
     database_url: str = "postgresql+asyncpg://dsh:dsh@postgres:5432/dsh"
     redis_url: str = "redis://redis:6379/0"
+    skill_cache_namespace: str = "dsh"
+    audit_cleanup_enabled: bool = True
     cors_origins: str = "*"
     runtime_profile_default: str = "default"
     runtime_idle_ttl_seconds: int = 900
@@ -135,7 +138,7 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    return Settings(_env_file=os.environ.get("DSH_LOCAL_ENV_FILE", ".env"))
 
 
 # This catalog drives the test console. Keep secrets explicitly marked so the

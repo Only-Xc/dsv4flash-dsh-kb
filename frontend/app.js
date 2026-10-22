@@ -410,6 +410,8 @@ function renderConfig(items) {
         input.type = inputType;
       }
       input.dataset.key = item.key;
+      input.disabled = Boolean(item.readOnly);
+      if (item.source === "local_override") label.querySelector("small").append(" · 本地连接，只读");
       input.dataset.secret = item.secret ? "1" : "0";
       input.dataset.multiline = item.multiline ? "1" : "0";
       input.value = configValue(item);
@@ -1280,6 +1282,7 @@ async function loadAuditConversations(page = state.auditConversationPage) {
 async function saveConfig() {
   const patch = {};
   document.querySelectorAll("#configForm [data-key]").forEach((input) => {
+    if (input.disabled) return;
     const value = input.value.trim();
     if (input.dataset.secret === "1" && !value) return;
     if (value || input.dataset.multiline === "1") patch[input.dataset.key] = input.type === "number" ? Number(value) : value;

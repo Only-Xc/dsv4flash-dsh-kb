@@ -30,3 +30,16 @@ umc-customer-portal-features-ai-chatbot-upgrade/.env.*
 # This is a separately managed customer frontend workspace, not part of the
 # DSH knowledge-base repository.
 /umc-customer-portal-features-ai-chatbot-upgrade/
+
+# Local agent skills and scratch state live outside version control.
+/.codex-skills/
+
+# Local development environment, SSH tunnel state, and generated test cases
+# may contain credentials or live response captures; keep them untracked.
+/.env.local
+/.state/
+/test-case/
+/script/
+/scripts/
+/.DS_Store
+/backend/requirements-dev.txt
