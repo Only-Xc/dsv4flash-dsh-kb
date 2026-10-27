@@ -189,14 +189,27 @@ def recall_skill_candidates(
     if active_domain and scores:
         scores[active_domain] = scores.get(active_domain, 0.0) + 0.10
     ranked = sorted(scores.items(), key=lambda pair: (-pair[1], pair[0]))
+    active_skill = next(
+        (item for item in catalog if item.get("skillId") == context.get("activeSkillId")),
+        None,
+    )
     if not ranked:
+        if active_skill:
+            # Elliptical follow-ups need a candidate even without alias matches.
+            # The classifier still decides whether the business topic continues.
+            return DomainRecall([_skill_domain(active_skill)], [active_skill], {})
         return DomainRecall([], [], {})
     selected_domain = ranked[0][0]
     candidates = sorted(
         (item for item in catalog if _skill_domain(item) == selected_domain),
         key=lambda item: str(item.get("skillId") or ""),
     )
-    return DomainRecall([selected_domain], candidates, {domain: round(score, 3) for domain, score in ranked})
+    domains = [selected_domain]
+    if active_skill and active_skill not in candidates:
+        candidates.append(active_skill)
+        if _skill_domain(active_skill) not in domains:
+            domains.append(_skill_domain(active_skill))
+    return DomainRecall(domains, candidates, {domain: round(score, 3) for domain, score in ranked})
 
 
 def add_keyword_skill_candidate(

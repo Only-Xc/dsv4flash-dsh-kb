@@ -1043,11 +1043,14 @@ def build_system_prompt(
     operator_prompt: str = "",
     skill_content: str = "",
     profile_context: object | None = None,
+    available_tools: list[dict[str, Any]] | None = None,
 ) -> str:
     guardrails = [
         "Use only trusted tool evidence. When evidence is unavailable, state the limitation and never invent account data, fees, regulations, or API capabilities.",
         "Never expose internal Tool names, request arguments, serialized JSON, API envelopes, or internal evidence instructions. Convert verified evidence into a concise user-facing answer.",
         "Payments, appeals, complaints, downloads, and all other side effects require a preview and the user's explicit confirmation.",
+        "Preview and confirmation are necessary conditions, not evidence that an action is executable. Only the runtime action capabilities below can support an execution promise. If the requested action is absent, explain that the customer must use the appropriate portal channel; do not imply that confirmation will enable you to submit or execute it later.",
+        "Keep evidence attached to the procedure, page and record type it actually documents. A similar word does not make another page's filters or another workflow's submission checklist applicable. If evidence does not establish the requested feature, state that limitation instead of transferring unrelated steps.",
         "Candidate services are not eligibility decisions. Treat renewal and extension as distinct operations.",
         "PROFILE SCOPE: Account data is limited to the profile currently selected in the portal. Never claim to query, filter, or aggregate another profile. When the user names a different profile, ask them to switch it in the portal before continuing.",
     ]
@@ -1057,6 +1060,12 @@ def build_system_prompt(
         guardrails.append("The portal is in Global View. Do not represent profile-bound data as available until the user selects a concrete profile.")
     if route.category == "knowledge" and not evidence_available:
         guardrails.append("When knowledge-base evidence is unavailable, do not present general knowledge as a verified UMC rule.")
+    executable_actions = [
+        {key: item.get(key) for key in ("name", "description", "confirmationRequired")}
+        for item in (available_tools or [])
+        if item.get("sideEffect") == "write" and route.mode != "portal_action"
+    ]
+    guardrails.append("RUNTIME_EXECUTABLE_ACTIONS: " + json.dumps(executable_actions, ensure_ascii=False))
 
     target = "ARABIC" if response_language == "ar" else "ENGLISH"
     language_policy = [
@@ -1089,7 +1098,7 @@ def build_system_prompt(
             "CROSS-LANGUAGE CONSISTENCY RULES:",
             *(f"- {item}" for item in CROSS_LANGUAGE_CONSISTENCY_RULES),
             "SAFETY AND EVIDENCE RULES:",
-            *(f"- {item}" for item in guardrails),
+            *(item if item.startswith("RUNTIME_EXECUTABLE_ACTIONS:") else f"- {item}" for item in guardrails),
         ]
     )
     return "\n".join(prompt_parts)

@@ -2259,6 +2259,7 @@ def make_router(service: DSHService) -> APIRouter:
                         try:
                             async with httpx.AsyncClient(timeout=settings.umc_login_timeout_seconds) as client:
                                 response = await client.post(f"{base_url}/api/User/GetUserInfo", headers={"Authorization": f"Bearer {token}"}, json={})
+                            response.raise_for_status()
                             payload = response.json()
                             def find_user_id(value):
                                 if isinstance(value, dict):
@@ -2276,7 +2277,16 @@ def make_router(service: DSHService) -> APIRouter:
                                 return None
                             identity = audit_identity_from_user_info(payload)
                             claims_user_id = find_user_id(payload)
-                        except (httpx.HTTPError, ValueError, TypeError):
+                        except httpx.HTTPStatusError as exc:
+                            code = "umc_token_rejected" if exc.response.status_code in {401, 403} else "umc_upstream_unavailable"
+                            logger.warning("umc_ws_auth_failed request_id=%s code=%s http_status=%s", principal.request_id, code, exc.response.status_code)
+                            await send({"type": "error", "code": code})
+                            continue
+                        except httpx.HTTPError:
+                            logger.warning("umc_ws_auth_failed request_id=%s code=umc_upstream_unavailable", principal.request_id)
+                            await send({"type": "error", "code": "umc_upstream_unavailable"})
+                            continue
+                        except (ValueError, TypeError):
                             claims_user_id = None
                             identity = {"account": "", "currentRole": ""}
                     if not claims_user_id:

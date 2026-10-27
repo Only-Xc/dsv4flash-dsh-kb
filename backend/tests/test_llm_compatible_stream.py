@@ -10,6 +10,23 @@ from app.llm import LLMAdapter
 
 
 class CompatibleLLMTests(unittest.IsolatedAsyncioTestCase):
+    async def test_truncated_or_unterminated_stream_is_not_complete(self):
+        for finish, done in (("length", True), ("content_filter", True), (None, False)):
+            with self.subTest(finish=finish, done=done):
+                frames = [{"choices": [{"delta": {"content": "Unfinished answer"}, "finish_reason": finish}]}]
+                body = "".join("data: " + json.dumps(frame) + "\n\n" for frame in frames)
+                if done:
+                    body += "data: [DONE]\n\n"
+                with self.client_patch(lambda request: httpx.Response(200, text=body)):
+                    with self.assertRaises(RuntimeError):
+                        _ = [text async for text in self.adapter().stream([])]
+
+    async def test_malformed_stream_frame_is_not_silently_discarded(self):
+        body = 'data: {broken}\n\ndata: [DONE]\n\n'
+        with self.client_patch(lambda request: httpx.Response(200, text=body)):
+            with self.assertRaises(RuntimeError):
+                _ = [text async for text in self.adapter().stream([])]
+
     def adapter(self):
         return LLMAdapter(Settings(_env_file=None, llm_base_url="https://provider.test/v1",
                                    llm_api_key="test-only-key", llm_model="configured-model"))

@@ -40,7 +40,7 @@ def test_rejected_fragment_never_reaches_client_and_prefix_cannot_be_retried():
         with pytest.raises(AnswerStreamRejected):
             await stream.verified("A replacement response.")
         await stream.verified(stream.content + incomplete_stream_notice("en"))
-        assert "partial" in stream.content
+        assert "incomplete" in stream.content
     asyncio.run(run())
 
 

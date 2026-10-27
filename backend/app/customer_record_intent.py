@@ -43,16 +43,19 @@ class CustomerRecordIntent:
     categories: frozenset[str]
     query: bool
     external_owner: bool
+    read_query: bool = False
 
 
 def customer_record_intent(content: str, context: ProfileContext | None = None) -> CustomerRecordIntent:
     text = normalize_record_text(content)
     words = re.findall(r"[\w]+", text)
     categories: set[str] = set()
+    record_words: set[str] = set()
     own = any(word in SELF_WORDS for word in words)
     for word in words:
         if word in EN_RECORD_NOUNS:
             categories.add(EN_RECORD_NOUNS[word])
+            record_words.add(word)
         arabic = word.removeprefix("و").removeprefix("ال")
         if arabic.startswith(("ل", "ب")):
             remainder = arabic[1:].removeprefix("ال")
@@ -60,10 +63,20 @@ def customer_record_intent(content: str, context: ProfileContext | None = None) 
                 arabic = remainder
         if arabic in AR_RECORD_NOUNS:
             categories.add(AR_RECORD_NOUNS[arabic])
+            record_words.add(word)
         for suffix in ("ي", "نا"):
             if arabic.endswith(suffix) and arabic[:-len(suffix)] in AR_RECORD_NOUNS:
                 categories.add(AR_RECORD_NOUNS[arabic[:-len(suffix)]])
                 own = True
+                record_words.add(word)
+    has_query_word = any(
+        word in QUERY_WORDS or word.removeprefix("و").removeprefix("ال") in QUERY_WORDS
+        for word in words
+    )
+    read_query = bool(categories) and (
+        has_query_word
+        or (own and all(word in SELF_WORDS or word in record_words for word in words))
+    )
     query = bool(categories) and (own or any(word in QUERY_WORDS for word in words))
     if not query:
         # A bare account handle is a common follow-up to a records question.
@@ -108,4 +121,4 @@ def customer_record_intent(content: str, context: ProfileContext | None = None) 
             )
             if candidate not in non_owners and not is_record_word and not re.fullmatch(r"[a-z]{2,6}(?:-\d+){3,}", candidate):
                 external = True
-    return CustomerRecordIntent(frozenset(categories), query, external)
+    return CustomerRecordIntent(frozenset(categories), query, external, read_query)

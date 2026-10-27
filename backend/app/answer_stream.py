@@ -14,6 +14,8 @@ import re
 import time
 from collections.abc import AsyncIterable, Awaitable, Callable, Iterable
 
+from .language_messages import language_message
+
 
 Validator = Callable[[str], bool | Awaitable[bool]]
 Publisher = Callable[[dict], Awaitable[object]]
@@ -37,6 +39,17 @@ class AnswerStream:
         self.last_seq = 0
         self.started_at = time.perf_counter()
         self.block_receipts: list[dict] = []
+        self.attempts: list[dict] = []
+        self.failure_reason: str | None = None
+
+    def discard_private_draft(self) -> None:
+        """Only the owner of an unpublished working stream may discard a draft."""
+        self.content = ""
+        self.block_count = 0
+        self.last_seq = 0
+        self.block_receipts.clear()
+        self.status = "complete"
+        self.failure_reason = None
 
     async def _send(self, text: str, *, mode: str) -> None:
         if not text:
@@ -140,7 +153,7 @@ class AnswerStream:
             if inspect.isawaitable(accepted):
                 accepted = await accepted
             if accepted is not True:
-                raise AnswerStreamRejected("final block failed validation")
+                raise AnswerStreamRejected("public_content_rejected")
             await self._send(candidate[len(self.content):], mode="guarded_generation")
         if not self.content.strip():
             raise AnswerStreamRejected("empty generated answer")
@@ -150,7 +163,11 @@ class AnswerStream:
 def public_candidate(text: str) -> bool:
     """Reject serialized tool/secret frames even when a portal guard is lax."""
     if re.search(r"dsml|<\s*(?:tool_calls?|function_calls?|invoke)\b|"
-                 r"\b(?:api[_ -]?key|password|access[_ -]?token|authorization)[\"']?\s*[:=]|"
+                 r"\b(?:api[_ -]?key|access[_ -]?token|authorization)[\"']?\s*[:=]|"
+                 r"[\"']password[\"']\s*:|"
+                 r"\bpassword\s*=|"
+                 r"\bpassword\s*:\s*[\"'][^\"'\n]+[\"']|"
+                 r"(?m:^[ \t]*(?:[-*] )?password\s*:\s*[^\s]{8,}[ \t]*$)|"
                  r"[\"'](?:tool|toolName|tool_calls?|function_calls?)[\"']\s*:",
                  text, re.I):
         return False
@@ -177,6 +194,8 @@ def public_candidate(text: str) -> bool:
 
 def incomplete_stream_notice(language: str) -> str:
     """A failure receipt, never an invented business conclusion."""
+    if language in {"en", "ar", "ur", "ml", "tl"}:
+        return "\n\n" + language_message(language, "partial")
     return {
         "ar": "\n\nلم يكتمل الرد لأن الجزء المتبقي لم يجتز التحقق أو تعذر توليده. النص المعروض جزئي؛ يرجى إعادة المحاولة.",
         "zh": "\n\n回答未完成：剩余内容未通过校验或生成中断。当前显示的是部分回答，请重试。",
@@ -184,6 +203,8 @@ def incomplete_stream_notice(language: str) -> str:
 
 
 def cancelled_stream_notice(language: str) -> str:
+    if language in {"ur", "ml", "tl"}:
+        return "\n\n" + language_message(language, "cancelled")
     return {"ar": "\n\nتم إيقاف الرد؛ النص المعروض جزئي.",
             "zh": "\n\n已停止输出，当前内容为部分回答。"}.get(
         language, "\n\nThe response was stopped; the displayed answer is partial.")

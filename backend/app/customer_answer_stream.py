@@ -5,7 +5,11 @@ from __future__ import annotations
 import re
 from typing import Callable
 
-from .answer_stream import AnswerStream, incomplete_stream_notice
+import httpx
+
+from .answer_stream import AnswerStream, AnswerStreamRejected, incomplete_stream_notice
+from .language_messages import language_message
+from .llm import LLMStreamError
 from .response_safety import contains_unexpected_response_script, is_internal_tool_protocol
 
 # Format contract shared by all answer models. Evidence constraints stay
@@ -28,6 +32,7 @@ Never add facts the evidence does not support."""
 async def customer_generated_answer(
     stream: AnswerStream, llm, messages: list[dict], language: str,
     *, sanitize: Callable[[str], str] = lambda text: text,
+    private_draft: bool = False,
 ) -> tuple[str, str, str]:
     """No token escapes before validation; no retry can rewrite a public prefix."""
     reasoning: list[str] = []
@@ -62,19 +67,33 @@ async def customer_generated_answer(
                 llm.stream(prompt, on_reasoning=capture_reasoning),
                 validate=safe, sanitize=public_projection,
             )
+            stream.failure_reason = None
             return content, "".join(reasoning), "complete"
-        except Exception:
+        except Exception as exc:
+            if isinstance(exc, AnswerStreamRejected):
+                reason = "answer_validation_rejected"
+            elif isinstance(exc, (httpx.TimeoutException, TimeoutError)):
+                reason = "generation_timeout"
+            elif isinstance(exc, LLMStreamError):
+                reason = exc.reason
+            elif isinstance(exc, httpx.HTTPStatusError):
+                reason = "model_http_error"
+            else:
+                reason = "generation_unavailable"
+            stream.attempts.append({"attempt": attempt + 1, "failure": reason})
+            stream.failure_reason = reason
+            retryable = isinstance(exc, (AnswerStreamRejected, LLMStreamError, httpx.TimeoutException, TimeoutError))
+            if private_draft:
+                stream.discard_private_draft()
+                stream.failure_reason = reason
+            if not stream.content and not attempt and retryable:
+                reasoning.clear()
+                continue
             if stream.content:
                 stream.status = "partial"
                 await stream.verified(stream.content + incomplete_stream_notice(language))
                 return stream.content, "".join(reasoning), "partial"
-            if attempt:
-                stream.status = "failed"
-                failure = (
-                    "تعذر علي إعداد رد تم التحقق منه باللغة المطلوبة. يرجى المحاولة مرة أخرى."
-                    if language == "ar"
-                    else "I could not prepare a validated response in the requested language. Please retry."
-                )
-                await stream.verified(failure)
-                return stream.content, "".join(reasoning), "failed"
+            stream.status = "failed"
+            await stream.verified(language_message(language, "failure"))
+            return stream.content, "".join(reasoning), "failed"
     raise AssertionError("unreachable")

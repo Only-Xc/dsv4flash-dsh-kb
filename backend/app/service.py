@@ -4,6 +4,7 @@ import json
 import re
 import time
 from collections import defaultdict
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
@@ -16,6 +17,10 @@ from .db import AuditRecord, ConfigEntry, Conversation, MessageIdempotency, Sess
 from .customer_documents import CustomerDocumentClient
 from .console_auth import CONSOLE_PASSWORD_CONFIG_KEY, DEFAULT_CONSOLE_PASSWORD
 from .llm import LLMAdapter
+from .language_bridge import LanguageBridge, LanguageTurn
+from .language_history import load_language_records, previous_language, recent_language_context, working_history
+from .language_messages import language_message
+from .language_prompts import native_answer_messages
 from .knowledge import KnowledgeGatewayClient
 from .ocr import OCRGatewayClient
 from .platform import PlatformGatewayClient
@@ -81,7 +86,7 @@ class DSHService:
         if not profile_context or not profile_context.is_global_view:
             return False
         intent = customer_record_intent(content, profile_context)
-        return intent.query and not intent.external_owner
+        return intent.read_query and not intent.external_owner
 
     @staticmethod
     def is_application_list_request(content: str) -> bool:
@@ -95,7 +100,7 @@ class DSHService:
         """
 
         intent = customer_record_intent(content)
-        return "applications" in intent.categories and intent.query
+        return "applications" in intent.categories and intent.read_query
 
     @staticmethod
     def profile_scope_guard(content: str, response_language: str, profile_context: ProfileContext | None) -> dict[str, Any] | None:
@@ -216,6 +221,7 @@ class DSHService:
         self.skill_catalog = SkillCatalogCache(self.settings.redis_url, self.settings.skill_cache_namespace)
         self._turn_tasks: dict[str, asyncio.Task[None]] = {}
         self._answer_streams: dict[str, tuple[AnswerStream, str]] = {}
+        self._language_turns: dict[str, LanguageTurn] = {}
         self._writer_locks: dict[str, asyncio.Lock] = {}
 
     @staticmethod
@@ -658,6 +664,12 @@ class DSHService:
         catalog = await self.skill_catalog.load(db)
         recall = recall_skill_candidates(question, catalog, context)
         recall = add_keyword_skill_candidate(recall, catalog, keyword_route.skill_id)
+        if not recall.scores and (context or {}).get("activeSkillId"):
+            fallback = configured_knowledge_fallback(
+                catalog, getattr(self.settings, "skill_router_fallback_skill_id", DEFAULT_SKILL_ROUTER_FALLBACK_SKILL_ID)
+            )
+            if fallback:
+                recall = add_keyword_skill_candidate(recall, catalog, fallback["skillId"])
         candidates = recall.candidates
         candidate_ids = [str(item.get("skillId")) for item in candidates]
         metadata["candidateSkillIds"] = candidate_ids
@@ -673,9 +685,10 @@ class DSHService:
             try:
                 llm_result = await self.llm.route_skill(question, candidates, context)
                 valid, fallback_reason = valid_llm_route(llm_result, candidates)
-            except Exception:
+            except Exception as exc:
                 valid = False
                 fallback_reason = "router_unavailable"
+                metadata["routerFailureType"] = type(exc).__name__
         llm_skill_id = llm_result.get("skillId") if isinstance(llm_result, dict) else None
         metadata.update(
             {
@@ -704,10 +717,16 @@ class DSHService:
             )
             metadata["intentId"] = intent_id
             metadata["filters"] = filters
-            return self.route_shape_for_skill(llm_skill_id, catalog), metadata
+            resolved_question = (llm_result or {}).get("resolvedQuestion") or question
+            metadata["resolvedQuestion"] = resolved_question
+            # Reuse the selected Skill's published route restrictions for the
+            # resolved follow-up. Tool arguments and authorization still use the
+            # original message and authenticated principal, never this rewrite.
+            contextual_route = resolve_configured_skill(resolved_question, [selected_candidate], canonicalize=False)
+            return contextual_route or self.route_shape_for_skill(llm_skill_id, catalog), metadata
         metadata["fallbackReason"] = fallback_reason or "invalid_output"
         active_skill_id = str((context or {}).get("activeSkillId") or "")
-        if active_skill_id and active_skill_id in candidate_ids:
+        if active_skill_id and active_skill_id in candidate_ids and recall.scores and recall.domains[0] == (context or {}).get("activeDomain"):
             # The lexical domain gate has already confined the question to the
             # active business domain. Keep that business context when the LLM
             # router is temporarily unavailable instead of querying the global
@@ -988,10 +1007,60 @@ class DSHService:
             query = query.where(SessionEvent.event_type == event_type)
         return list((await db.execute(query)).scalars().all())
 
+    async def _rewrite_language_answer(self, original_request: str, verified_answer: str, target_language: str) -> str:
+        """Use one main-model generation to present existing facts; never run tools."""
+        fragments = [
+            fragment async for fragment in self.llm.stream(
+                native_answer_messages(original_request, verified_answer, target_language)
+            )
+        ]
+        return "".join(fragments)
+
+    async def append_language_progress(self, db: AsyncSession, conversation: Conversation, language: str, request_id: str) -> None:
+        """Report an actual language stage without exposing its implementation."""
+        language = language if language in {"en", "ar", "ur", "ml", "tl"} else "en"
+        await self.append_event(db, conversation, "assistant.status", {
+            "phase": "preparing", "state": "running",
+            "message": language_message(language, "progress"),
+            "responseLanguage": language, "requestId": request_id,
+        })
+
     async def append_event(self, db: AsyncSession, conversation: Conversation, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         active = getattr(self, "_answer_streams", {}).get(conversation.conversation_id)
+        language_turn = getattr(self, "_language_turns", {}).get(conversation.conversation_id)
+        generation_status = payload.get("streamStatus", "complete")
+        if event_type == "assistant.message" and language_turn:
+            working_content = str(payload.get("content") or "")
+            if language_turn.requires_bridge and generation_status in {"partial", "failed"}:
+                language_turn.failure = "business_response_incomplete"
+                language_turn.failure_reason = str(payload.get("failureReason") or "generation_unavailable")
+            async def progress(language: str) -> None:
+                await self.append_language_progress(db, conversation, language, str(payload.get("requestId") or ""))
+
+            public_content = await LanguageBridge(self.llm, progress).render(language_turn, working_content, rewrite=self._rewrite_language_answer)
+            await self.append_audit(db, conversation, "language.output", {
+                "workingText": working_content, "targetLanguage": language_turn.target_language,
+                "promptVersion": language_turn.prompt_version, "failure": language_turn.failure,
+                "failureReason": language_turn.failure_reason,
+                "reviews": language_turn.output_reviews,
+                "fallback": language_turn.output_fallback,
+                "generationStatus": generation_status,
+            }, request_id=str(payload.get("requestId") or ""))
+            payload = {**payload, "content": public_content,
+                       "responseLanguage": language_turn.target_language,
+                       "direction": "rtl" if language_turn.target_language in {"ar", "ur"} else "ltr"}
+            if language_turn.failure and active:
+                active[0].status = "failed"
+                active[0].failure_reason = language_turn.failure_reason or language_turn.failure
+                payload["failureReason"] = active[0].failure_reason
+        elif event_type == "assistant.status" and language_turn:
+            payload = {**payload, "responseLanguage": language_turn.target_language}
+            if language_turn.requires_bridge:
+                payload["message"] = language_message(language_turn.target_language, "progress")
         if event_type == "assistant.message" and active:
             stream, _ = active
+            if stream.status != "failed" and generation_status in {"partial", "failed", "cancelled"}:
+                stream.status = generation_status
             await stream.verified(str(payload.get("content") or ""))
             payload = {**payload, "streamVersion": stream.protocol_version,
                        "streamStatus": stream.status}
@@ -1226,29 +1295,129 @@ class DSHService:
                 )
                 return {"accepted": True, "duplicate": False, "conversationId": conversation_id, "seq": event["seq"], "requestId": principal.request_id, "runtimeId": lease.runtime_id}
 
+    async def prepare_language_turn(
+        self,
+        db: AsyncSession,
+        conversation: Conversation,
+        history: list[SessionEvent],
+        request_id: str,
+    ) -> tuple[list, LanguageTurn]:
+        """Prepare private business wording before any routing or tool execution."""
+        latest_user = next(
+            (event for event in reversed(history) if event.event_type == "user.message"),
+            None,
+        )
+        original = str(latest_user.event_json.get("content") or "") if latest_user else ""
+        async def progress(language: str) -> None:
+            await self.append_language_progress(db, conversation, language, request_id)
+
+        bridge = LanguageBridge(self.llm, progress)
+        context = recent_language_context(
+            [event for event in history if not latest_user or event.seq != latest_user.seq]
+        )
+        prior_language = previous_language(history)
+        if prior_language == "und":
+            # Pre-upgrade answers have no language metadata and used only the native pair.
+            prior_answer = next(
+                (
+                    event
+                    for event in reversed(history)
+                    if event.event_type == "assistant.message"
+                ),
+                None,
+            )
+            if prior_answer:
+                prior_language = response_language_for(
+                    str(prior_answer.event_json.get("content") or "")
+                )
+        if (
+            not original.strip()
+            and latest_user
+            and isinstance(latest_user.event_json.get("attachment"), dict)
+        ):
+            language = prior_language if prior_language != "und" else "en"
+            turn = LanguageTurn(original, language, language, original)
+        else:
+            turn = await bridge.prepare(
+                original,
+                previous_language=prior_language,
+                context=context,
+            )
+        try:
+            records = await load_language_records(db, conversation)
+            projected = working_history(history, records)
+        except ValueError:
+            turn.failure = "invalid_language_history"
+            projected = history
+        if latest_user and not turn.failure:
+            # Working projections are detached from persisted public event payloads.
+            projected = [
+                replace(
+                    event, event_json={**event.event_json, "content": turn.working_text}
+                )
+                if event.seq == latest_user.seq
+                else event
+                for event in projected
+            ]
+        await self.append_audit(
+            db,
+            conversation,
+            "language.input",
+            {
+                **turn.input_record(),
+                "userEventSeq": latest_user.seq if latest_user else 0,
+            },
+            request_id=request_id,
+        )
+        return projected, turn
+
     async def _run_turn(self, principal: Principal, conversation_id: str, profile_context: ProfileContext | None = None) -> None:
         if not hasattr(self, "_answer_streams"):
             self._answer_streams = {}
+        if not hasattr(self, "_language_turns"):
+            self._language_turns = {}
         async with self.writer_lock_for(conversation_id):
             try:
                 async with SessionLocal() as db:
                     conversation = await self.get_owned_conversation(db, principal, conversation_id)
                     history = await self.list_events(db, conversation, after_seq=0)
-                    messages = [{"role": "user" if event.event_type == "user.message" else "assistant", "content": event.event_json.get("content", "")} for event in history if event.event_type in {"user.message", "assistant.message"}]
                     await self.append_event(db, conversation, "turn.started", {"requestId": principal.request_id, "runtimeId": conversation.runtime_id})
+                    history, language_turn = await self.prepare_language_turn(db, conversation, history, principal.request_id)
+                    self._language_turns[conversation_id] = language_turn
+                    messages = [{"role": "user" if event.event_type == "user.message" else "assistant", "content": event.event_json.get("content", "")} for event in history if event.event_type in {"user.message", "assistant.message"}]
                     latest_user = next((event for event in reversed(history) if event.event_type == "user.message"), None)
                     latest_content = latest_user.event_json.get("content", "") if latest_user else ""
                     raw_attachment = latest_user.event_json.get("attachment") if latest_user else None
                     latest_attachment = raw_attachment if isinstance(raw_attachment, dict) else None
-                    response_language = response_language_for(latest_content)
+                    response_language = language_turn.working_language
 
                     async def publish_block(payload: dict) -> dict:
                         return await self.publish_stream_event(conversation, "assistant.chunk", {
                             **payload, "requestId": principal.request_id,
                             "runtimeId": conversation.runtime_id,
+                            "responseLanguage": language_turn.target_language,
+                            "direction": "rtl" if language_turn.target_language in {"ar", "ur"} else "ltr",
                         })
                     answer_stream = AnswerStream(publish_block)
-                    self._answer_streams[conversation_id] = (answer_stream, response_language)
+                    self._answer_streams[conversation_id] = (answer_stream, language_turn.target_language)
+                    if language_turn.requires_bridge:
+                        async def hold_working_block(payload: dict) -> None:
+                            # English blocks stay private until the final translation is validated.
+                            return None
+                        answer_stream = AnswerStream(hold_working_block)
+                    if language_turn.failure:
+                        await self.append_event(db, conversation, "assistant.message", {
+                            "content": "", "requestId": principal.request_id,
+                        })
+                        await self.append_event(db, conversation, "turn.completed", {"requestId": principal.request_id})
+                        conversation.status = "READY"
+                        await db.commit()
+                        lease = self.runtime_manager.get(conversation_id)
+                        if lease:
+                            lease.state = "READY"
+                        return
+                    if language_turn.requires_bridge:
+                        messages.insert(max(0, len(messages) - 1), LanguageBridge.original_context(language_turn))
                     # Send a first visible update before deterministic routing,
                     # external calls, or the LLM request can spend time waiting.
                     await self.append_status(
@@ -1485,7 +1654,7 @@ class DSHService:
                         tool_request = (
                             "knowledge.search",
                             {
-                                "query": build_knowledge_query(route, latest_content),
+                                "query": build_knowledge_query(route, str(route_metadata.get("resolvedQuestion") or latest_content)),
                                 "folder_id": self.settings.knowledge_default_folder_id,
                                 "top_k": self.settings.knowledge_top_k,
                             },
@@ -1546,6 +1715,8 @@ class DSHService:
                             "routingLocked": route_metadata.get("routingLocked", False),
                             "attachmentOcrForced": route_metadata.get("attachmentOcrForced", False),
                             "routeContextUsed": route_metadata.get("routeContextUsed"),
+                            "resolvedQuestion": route_metadata.get("resolvedQuestion"),
+                            "routerFailureType": route_metadata.get("routerFailureType"),
                             "confidence": route_metadata.get("confidence"),
                             "needsClarification": route_metadata.get("needsClarification"),
                             "crossSkillHandoffId": route_metadata.get("crossSkillHandoffId"),
@@ -1625,6 +1796,7 @@ class DSHService:
                                 operator_prompt=str(getattr(self.settings, "system_prompt", "") or ""),
                                 skill_content=selected_skill.content if selected_skill else "",
                                 profile_context=profile_context,
+                                available_tools=selected_tool_docs,
                             ),
                         },
                     )
@@ -2058,11 +2230,13 @@ class DSHService:
                             content, reasoning, stream_status = await customer_generated_answer(
                                 answer_stream, self.llm, messages, response_language,
                                 sanitize=(lambda text: sanitizer(text, response_language)) if sanitizer else (lambda text: text),
+                                private_draft=language_turn.requires_bridge,
                             )
                             await self.append_audit(db, conversation, "answer.stream", {
                                 "streamVersion": answer_stream.protocol_version,
                                 "blockCount": answer_stream.block_count, "status": stream_status,
                                 "blockReceipts": answer_stream.block_receipts,
+                                "attempts": answer_stream.attempts, "failureReason": answer_stream.failure_reason,
                                 "requestId": principal.request_id, "runtimeId": conversation.runtime_id,
                             }, request_id=principal.request_id, runtime_id=conversation.runtime_id)
                         except Exception as exc:
@@ -2104,7 +2278,10 @@ class DSHService:
                                 request_id=principal.request_id,
                                 runtime_id=conversation.runtime_id,
                             )
-                        await self.append_event(db, conversation, "assistant.message", {"content": content, "requestId": principal.request_id})
+                        await self.append_event(db, conversation, "assistant.message", {
+                            "content": content, "requestId": principal.request_id,
+                            "streamStatus": stream_status, "failureReason": answer_stream.failure_reason,
+                        })
                     await self.append_event(db, conversation, "turn.completed", {"requestId": principal.request_id, "runtimeId": conversation.runtime_id})
                     conversation.status = "READY"
                     conversation.last_activity_at = datetime.now(timezone.utc)
@@ -2116,10 +2293,13 @@ class DSHService:
                 raise
             except Exception as exc:
                 active = self._answer_streams.pop(conversation_id, None)
+                language_turn = self._language_turns.get(conversation_id)
                 async with SessionLocal() as db:
                     try:
                         conversation = await self.get_owned_conversation(db, principal, conversation_id)
                         if active and active[0].content:
+                            # The retained prefix is already public target-language text.
+                            self._language_turns.pop(conversation_id, None)
                             stream, language = active
                             conversation.last_seq = max(conversation.last_seq, stream.last_seq)
                             await stream.verified(stream.content + incomplete_stream_notice(language))
@@ -2128,12 +2308,20 @@ class DSHService:
                                 "content": stream.content, "streamVersion": stream.protocol_version,
                                 "streamStatus": "partial", "requestId": principal.request_id,
                             })
+                        elif language_turn and language_turn.requires_bridge:
+                            language_turn.failure = "business_response_unavailable"
+                            await self.append_event(db, conversation, "assistant.message", {
+                                "content": "", "requestId": principal.request_id,
+                            })
                         conversation.status = "DEAD"
                         conversation.last_error = str(exc)[:1_000]
-                        await self.append_event(db, conversation, "runtime.error", {"requestId": principal.request_id, "error": str(exc)[:500]})
+                        public_error = "The response could not be completed." if language_turn and language_turn.requires_bridge else str(exc)[:500]
+                        await self.append_event(db, conversation, "runtime.error", {"requestId": principal.request_id, "error": public_error})
                         await db.commit()
                     except Exception:
                         pass
+            finally:
+                self._language_turns.pop(conversation_id, None)
 
     async def cancel(self, principal: Principal, conversation_id: str) -> None:
         async with SessionLocal() as db:
@@ -2157,6 +2345,13 @@ class DSHService:
                     await self.append_event(db, conversation, "assistant.message", {
                         "content": stream.content, "streamVersion": stream.protocol_version,
                         "streamStatus": "cancelled", "requestId": principal.request_id,
+                    })
+                elif active and active[1] in {"ur", "ml", "tl"}:
+                    await self.append_event(db, conversation, "assistant.message", {
+                        "content": language_message(active[1], "cancelled"),
+                        "responseLanguage": active[1], "streamStatus": "cancelled",
+                        "direction": "rtl" if active[1] == "ur" else "ltr",
+                        "requestId": principal.request_id,
                     })
                 conversation.status = "READY"
                 await self.append_event(db, conversation, "turn.cancelled", {"requestId": principal.request_id})
