@@ -12,7 +12,7 @@
 - Runtime/Instance Manager：每个 conversation 一个独立逻辑租约，状态包含 `CLEAN_IDLE/STARTING/READY/BUSY/DRAINING/CLEANING/DEAD`。
 - LLM Adapter：未配置模型时使用 mock，配置 `LLM_BASE_URL`/`LLM_API_KEY` 后调用 OpenAI-compatible streaming API（默认模型名 `qwen3.8-flash`）。回答生成和 JSON Skill 分类共用这组配置；流式接收会忽略合法的空 `choices` 统计帧，不将其误判为回答失败。
 - Customer 千问配置：北京地域使用 `https://dashscope.aliyuncs.com/compatible-mode/v1`，模型 ID 为 `qwen3.8-flash`，key 仅放入未跟踪的 `.env` 或受保护的运行配置。`Qwen/Qwen3.8-Flash-Next` 是开源权重仓库 ID，不是该托管接口的模型 ID。[官方模型卡](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)说明 Qwen3.8-Flash 是基于 Flash-Next、增加生产功能的官方托管版本；[官方 API 示例](https://www.alibabacloud.com/blog/qwen3-8-flash-next-a-new-architecture-towardsultimate-cost-efficiency_603501)列明地域端点和调用名。不要把托管服务宣称为逐权重一致的开源部署。Customer 配置不应用于 Admin 或共享知识库服务。
-- 对话语言策略：英文问题使用英文回答，阿语问题使用阿语回答，中文及其他语言统一回退到英文；工具结果、知识库内容或内部流程提示的语言不会覆盖该规则。
+- Conversation languages: English and Arabic use native generation; Urdu, Malayalam and Tagalog use a validated English bridge. See [Multilingual runtime](doc/multilingual-runtime.md).
 - 会话初始化：新建会话后持久化一条 `assistant.welcome` 英阿双语欢迎事件，并通过 WS/SSE 的序号回放机制展示；该事件不参与正常问答完成判定。
 - 配置与 Skill API：提供版本化配置更新和运维 Skill CRUD，终端测试界面只选择会话，不上传 Skill。
 - OCR Tool Gateway：只由 DSH Runtime 调用的内部工具服务，转发到 PaddleOCR-VL-1.6 产线 API；不向前端暴露 OCR 业务接口。
@@ -45,7 +45,7 @@ WHERE scope = 'system' AND key = 'console_password';
 
 ## 对话语言与欢迎语
 
-DSH 根据用户最新一条消息确定当前轮次的输出语言。主要为阿语时使用阿语；英文及其他语言均使用英文。系统提示词会显式写入本轮目标语言，避免上游 Tool、检索证据或内部流程提示改变回答语言。
+DSH identifies the message language independently of the Portal locale. English and Arabic retain native generation. Urdu, Malayalam and Tagalog requests use private English working text with the existing business flow, followed by validated output conversion. Short references inherit the previous response language; explicit supported-language requests are honored. Ambiguous or unsupported input receives a clarification/failure receipt rather than a guessed business interpretation. Intermediate English is excluded from public messages and stream chunks. The existing console test-generation page remains English/Arabic; multilingual runtime checks are documented separately.
 
 每个新会话的首个持久化事件为以下双语欢迎语：
 
